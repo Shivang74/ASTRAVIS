@@ -698,7 +698,13 @@ export function App() {
                       pts.reduce((s, p) => s + p.xiObsArcsec, 0) / pts.length;
                     const meanEta =
                       pts.reduce((s, p) => s + p.etaObsArcsec, 0) / pts.length;
-                    const scale = 115;
+                    const maxSpreadArcsec = Math.max(
+  0.15,
+  ...pts.map((p) =>
+    Math.hypot(p.xiObsArcsec - meanXi, p.etaObsArcsec - meanEta)
+  )
+);
+const scale = Math.min(140, 65 / maxSpreadArcsec);
 
                     const toScreen = (xi: number, eta: number) => ({
                       x: 107 + (xi - meanXi) * scale,

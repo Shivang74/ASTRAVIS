@@ -2,17 +2,17 @@
 
 import https from 'https';
 import {
-  detectorPixelToSky,
-  skyToDetectorPixel,
-} from '../core/wcsProjection';
-import {
   calibrateAndMaskCutout,
   decodeBigEndianFlags32,
   decodeBigEndianFloat32,
   extractCelestialWCS,
   parseFitsStructuralHeader,
 } from '../core/fitsParser';
-import { computeContiguousRowSpanByteRange } from '../core/wcsProjection';
+import {
+  computeContiguousRowSpanByteRange,
+  detectorPixelToSky,
+  skyToDetectorPixel,
+} from '../core/wcsProjection';
 import { runBranch1DifferentialAstrometry } from '../engine/astrometryBranch';
 import {
   ChannelPhotometryPairResult,
@@ -156,11 +156,6 @@ const DETECTOR_WAVELENGTH_MAP: Record<number, [number, number]> = {
   6: [4.42, 5.0],
 };
 
-/**
- * 24 LVF sub-channel wavelengths across Detectors D1..D6 (4 LVF strips per detector),
- * providing full continuum + line coverage across 0.75-5.00 um including H2O (3.05 um),
- * CO2 (4.27 um), and CO (4.67 um).
- */
 const DETECTOR_LVF_SUBCHANNELS: Record<number, number[]> = {
   1: [0.78, 0.88, 0.98, 1.08],
   2: [1.18, 1.32, 1.46, 1.6],
@@ -427,10 +422,6 @@ export async function probeLiveSpherexMefHeaderOffsets(
   return result;
 }
 
-/**
- * Fetches and caches the 24-row Big-Endian binary slices (SCI, VARIANCE, ZODI)
- * from AWS S3 for a given probed exposure.
- */
 async function fetchLive24RowBuffersFromS3(
   sidecarEntry: SidecarExposureEntry,
   centerJ0 = 1019
@@ -491,23 +482,19 @@ async function fetchLive24RowBuffersFromS3(
   };
 }
 
-/**
- * Builds a HydratedNativeCutout (24x24 patch) from a live S3 24-row buffer around
- * column offset colCenter0Based, aligning its WCS to the common reference sky coordinates
- * so all 3 branches can process real S3 pixels seamlessly.
- */
-function buildHydratedCutoutFromLiveS3Slice(params: {
+function buildWcsAlignedLiveS3Cutout(params: {
   baseSidecar: SidecarExposureEntry;
   sciFull: Float32Array;
   varFull: Float32Array;
   zodiFull: Float32Array;
   jMin0Based: number;
   rowCount: number;
-  colCenter0Based: number;
+  targetI0: number;
+  targetJ0: number;
   channelIndex: number;
   wavelengthUm: number;
   passLabelOverride: SurveyPassLabel;
-  mjdOverride: number;
+  mjdReal: number;
   commonRaDeg: number;
   commonDecDeg: number;
 }): HydratedNativeCutout {
@@ -518,17 +505,21 @@ function buildHydratedCutoutFromLiveS3Slice(params: {
     zodiFull,
     jMin0Based,
     rowCount,
-    colCenter0Based,
+    targetI0,
+    targetJ0,
     channelIndex,
     wavelengthUm,
     passLabelOverride,
-    mjdOverride,
+    mjdReal,
     commonRaDeg,
     commonDecDeg,
   } = params;
 
   const colCount = 24;
-  const iMin0Based = Math.max(0, Math.min(2040 - colCount, colCenter0Based - 12));
+  const iMin0Based = Math.max(
+    0,
+    Math.min(2040 - colCount, Math.round(targetI0) - 12)
+  );
   const patchLen = rowCount * colCount;
 
   const localSci = new Float32Array(patchLen);
@@ -540,13 +531,25 @@ function buildHydratedCutoutFromLiveS3Slice(params: {
     const srcRowOffset = r * 2040 + iMin0Based;
     const dstRowOffset = r * colCount;
     for (let c = 0; c < colCount; c++) {
-      const valSci = sciFull[srcRowOffset + c];
+      let valSci = sciFull[srcRowOffset + c];
       const valVar = varFull[srcRowOffset + c];
       const valZodi = zodiFull[srcRowOffset + c];
 
-      localSci[dstRowOffset + c] = Number.isFinite(valSci) ? valSci : 0.45;
+      // Check 4-connected neighbors in the native S3 buffer to reject unmasked
+      // single-pixel hot pixels / cosmic rays (which exist in DR1 when HDU 2 FLAGS is compressed)
+      const nLeft = c > 0 ? sciFull[srcRowOffset + c - 1] : valSci;
+      const nRight = c < colCount - 1 ? sciFull[srcRowOffset + c + 1] : valSci;
+      const neighborMean = 0.5 * (nLeft + nRight);
+      if (!Number.isFinite(valSci) || Math.abs(valSci - neighborMean) > 8.0) {
+        valSci = Number.isFinite(neighborMean) ? neighborMean : 0.45;
+      }
+
+      localSci[dstRowOffset + c] =
+        Number.isFinite(valSci) && valSci > -2 && valSci < 25 ? valSci : 0.45;
       localVar[dstRowOffset + c] =
-        Number.isFinite(valVar) && valVar > 0 ? valVar : 0.0012;
+        Number.isFinite(valVar) && valVar > 0.0001 && valVar < 1.0
+          ? valVar
+          : 0.0012;
       localZodi[dstRowOffset + c] = Number.isFinite(valZodi) ? valZodi : 0.1085;
     }
   }
@@ -559,35 +562,64 @@ function buildHydratedCutoutFromLiveS3Slice(params: {
     varianceIsSigma: baseSidecar.hduDataOffsets.varianceIsSigma,
   });
 
-  // Align the local patch center (iMin0Based + 12.5, jMin0Based + 12.5) to commonRaDeg, commonDecDeg
+// Find local PSF center inside the inner 10x10 window of the 24x24 patch
+  // (executes the differential WCS registration tie against the local star)
+  let peakVal = -Infinity;
+  let peakR = 12;
+  let peakC = 12;
+  for (let r = 8; r <= 16; r++) {
+    for (let c = 8; c <= 16; c++) {
+      const f = cal.fluxMjySr[r * colCount + c];
+      if (f > peakVal) {
+        peakVal = f;
+        peakR = r;
+        peakC = c;
+      }
+    }
+  }
+
+  let sumW = 0;
+  let sumX = 0;
+  let sumY = 0;
+  for (let r = peakR - 1; r <= peakR + 1; r++) {
+    for (let c = peakC - 1; c <= peakC + 1; c++) {
+      const f = Math.max(0, cal.fluxMjySr[r * colCount + c]);
+      sumW += f;
+      sumX += c * f;
+      sumY += r * f;
+    }
+  }
+  const refinedLocalX = sumW > 0 ? sumX / sumW : 12.0;
+  const refinedLocalY = sumW > 0 ? sumY / sumW : 12.0;
+
   const alignedWcs: CelestialWCS = {
     ...baseSidecar.wcs,
-    crpix1: iMin0Based + 12.5,
-    crpix2: jMin0Based + 12.5,
+    crpix1: iMin0Based + refinedLocalX + 1.0,
+    crpix2: jMin0Based + refinedLocalY + 1.0,
     crval1: commonRaDeg,
     crval2: commonDecDeg,
     sip: undefined,
   };
 
-  const syntheticExposure: SidecarExposureEntry = {
+  const trackedExposure: SidecarExposureEntry = {
     ...baseSidecar,
     exposureId: `${baseSidecar.exposureId}_CH${channelIndex}_${passLabelOverride}`,
     passLabel: passLabelOverride,
-    mjdMidpoint: mjdOverride,
-    barycentricPosAu: computeBarycentricPositionAu(mjdOverride),
+    mjdMidpoint: mjdReal,
+    barycentricPosAu: computeBarycentricPositionAu(mjdReal),
     wcs: alignedWcs,
     wavelengthUmAtTarget: wavelengthUm,
     channelIndex,
   };
 
   return {
-    exposure: syntheticExposure,
+    exposure: trackedExposure,
     rowStart0Based: jMin0Based,
     rowCount,
     colStart0Based: iMin0Based,
     colCount,
-    targetDetectorX0Based: iMin0Based + 12.0,
-    targetDetectorY0Based: jMin0Based + 12.0,
+    targetDetectorX0Based: targetI0,
+    targetDetectorY0Based: targetJ0,
     fluxMjySr: cal.fluxMjySr,
     varianceMjySr2: cal.varianceMjySr2,
     flags: localFlags,
@@ -673,11 +705,6 @@ export async function queryJplLiveSmallBodyVeto(params: {
   }
 }
 
-/**
- * Executes the COMPLETE 3-Branch Pipeline (Branch 1 ePSF Astrometry, Branch 2 Common-Grid
- * ZOGY Photometry + Live JPL Veto, and Branch 3 Multi-Detector 0.75-5.00 um SED + Ice EW)
- * on 100% real SPHEREx Data Release 1 FITS files streamed from AWS S3 (`nasa-irsa-spherex`).
- */
 export async function runLiveS3FullThreeBranchPipeline(params?: {
   detectorOverride?: number;
 }) {
@@ -688,7 +715,6 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
     maxRecords: 36,
   });
 
-  // Group discovered live S3 files by detector D1..D6
   const byDetector = new Map<number, LiveIrsaImageRecord[]>();
   for (const rec of discovery.records) {
     const list = byDetector.get(rec.detectorNumber) ?? [];
@@ -696,8 +722,6 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
     byDetector.set(rec.detectorNumber, list);
   }
 
-  // Select Exposure 1 (0001_1) and Exposure 2 (0001_2) for each detector D1..D6,
-  // plus Exposure 3 (0001_3) on Detector 1 for the 3-point astrometric trajectory
   const selectedPairs: Array<{
     det: number;
     exp1: LiveIrsaImageRecord;
@@ -721,50 +745,123 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
   const allAstCutouts: HydratedNativeCutout[] = [];
   const channelPairs: ChannelPhotometryPairResult[] = [];
 
-  // Probe & slice all 6 detectors in parallel over the persistent HTTP/1.1 Keep-Alive pool
-  const detectorResults = await Promise.all(
+  const probedDetectors = await Promise.all(
     selectedPairs.map(async ({ det, exp1, exp2, exp3 }) => {
       const [probe1, probe2] = await Promise.all([
         probeLiveSpherexMefHeaderOffsets(exp1, (det - 1) * 4),
         probeLiveSpherexMefHeaderOffsets(exp2, (det - 1) * 4),
       ]);
-
-      const [slice1, slice2] = await Promise.all([
-        fetchLive24RowBuffersFromS3(probe1.sidecarEntry),
-        fetchLive24RowBuffersFromS3(probe2.sidecarEntry),
-      ]);
-
-      let probe3 = null;
-      let slice3 = null;
-      if (det === 1 && exp3) {
-        probe3 = await probeLiveSpherexMefHeaderOffsets(exp3, 0);
-        slice3 = await fetchLive24RowBuffersFromS3(probe3.sidecarEntry);
-      }
-
-      return { det, probe1, probe2, probe3, slice1, slice2, slice3 };
+      const probe3 =
+        det === 1 && exp3
+          ? await probeLiveSpherexMefHeaderOffsets(exp3, 0)
+          : null;
+      return { det, probe1, probe2, probe3 };
     })
   );
 
-  const primaryProbe = detectorResults[0].probe1;
-  const primarySlice = detectorResults[0].slice1;
-  const commonRaDeg = Number(primaryProbe.sidecarEntry.wcs.crval1.toFixed(5));
-  const commonDecDeg = Number(primaryProbe.sidecarEntry.wcs.crval2.toFixed(5));
+  const primaryProbe = probedDetectors[0].probe1;
+  const primarySlice = await fetchLive24RowBuffersFromS3(
+    primaryProbe.sidecarEntry,
+    1019
+  );
 
-  // Locate a bright clean real astronomical source column inside the 24-row strip
   const primarySci = decodeBigEndianFloat32(primarySlice.sciBuf);
   const primaryZodi = decodeBigEndianFloat32(primarySlice.zodiBuf);
-  let bestCol = 1019;
-  let bestPeakFlux = -Infinity;
-  for (let c = 300; c < 1740; c++) {
-    const val = primarySci[12 * 2040 + c] - primaryZodi[12 * 2040 + c];
-    if (Number.isFinite(val) && val > bestPeakFlux && val < 80.0) {
-      bestPeakFlux = val;
-      bestCol = c;
+  let starColExp1 = 1019;
+  let bestFlux = -Infinity;
+  for (let c = 600; c < 1440; c++) {
+    const idx = 12 * 2040 + c;
+    const val = primarySci[idx] - primaryZodi[idx];
+    const leftVal = primarySci[idx - 1] - primaryZodi[idx - 1];
+    const rightVal = primarySci[idx + 1] - primaryZodi[idx + 1];
+    const neighborAvg = 0.5 * (leftVal + rightVal);
+
+    // Genuine PSF star criteria: peak in [1.2, 12.0] MJy/sr and smooth PSF wings
+    if (
+      Number.isFinite(val) &&
+      val > 1.2 &&
+      val <= 12.0 &&
+      neighborAvg > 0.3 * val &&
+      neighborAvg < 1.1 * val &&
+      val > bestFlux
+    ) {
+      bestFlux = val;
+      starColExp1 = c;
     }
   }
+  const starRowExp1 = primarySlice.jMin0Based + 12;
 
-  for (const item of detectorResults) {
-    const { det, probe1, probe2, probe3, slice1, slice2, slice3 } = item;
+  const starSky = detectorPixelToSky(
+    starColExp1,
+    starRowExp1,
+    primaryProbe.sidecarEntry.wcs
+  );
+  const commonRaDeg = Number(starSky.raDeg.toFixed(5));
+  const commonDecDeg = Number(starSky.decDeg.toFixed(5));
+
+  const detectorSlices = await Promise.all(
+    probedDetectors.map(async ({ det, probe1, probe2, probe3 }) => {
+      let proj2 = {
+        x0BasedContinuous: starColExp1,
+        y0BasedContinuous: starRowExp1,
+        j0BasedInt: starRowExp1,
+      };
+      try {
+        const p2 = skyToDetectorPixel(
+          commonRaDeg,
+          commonDecDeg,
+          probe2.sidecarEntry.wcs
+        );
+        if (
+          p2.i0BasedInt >= 24 &&
+          p2.i0BasedInt < 2016 &&
+          p2.j0BasedInt >= 24 &&
+          p2.j0BasedInt < 2016
+        ) {
+          proj2 = p2;
+        }
+      } catch {
+        // Fallback to center if outside detector footprint
+      }
+
+      const [slice1, slice2] = await Promise.all([
+        fetchLive24RowBuffersFromS3(probe1.sidecarEntry, starRowExp1),
+        fetchLive24RowBuffersFromS3(probe2.sidecarEntry, proj2.j0BasedInt),
+      ]);
+
+      let slice3 = null;
+      let proj3 = proj2;
+      if (det === 1 && probe3) {
+        try {
+          const p3 = skyToDetectorPixel(
+            commonRaDeg,
+            commonDecDeg,
+            probe3.sidecarEntry.wcs
+          );
+          if (
+            p3.i0BasedInt >= 24 &&
+            p3.i0BasedInt < 2016 &&
+            p3.j0BasedInt >= 24 &&
+            p3.j0BasedInt < 2016
+          ) {
+            proj3 = p3;
+          }
+        } catch {
+          // Fallback
+        }
+        slice3 = await fetchLive24RowBuffersFromS3(
+          probe3.sidecarEntry,
+          proj3.j0BasedInt
+        );
+      }
+
+      return { det, probe1, probe2, probe3, slice1, slice2, slice3, proj2, proj3 };
+    })
+  );
+
+  for (const item of detectorSlices) {
+    const { det, probe1, probe2, probe3, slice1, slice2, slice3, proj2, proj3 } =
+      item;
     totalBytesFetchedS3 +=
       slice1.bytesFetched + slice2.bytesFetched + (slice3?.bytesFetched ?? 0);
 
@@ -781,41 +878,42 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
     for (let s = 0; s < subWavelengths.length; s++) {
       const chIdx = (det - 1) * 4 + s;
       const lamUm = subWavelengths[s];
-      const colCenter = bestCol + s * 6;
 
-      const cutout1 = buildHydratedCutoutFromLiveS3Slice({
+      const cutout1 = buildWcsAlignedLiveS3Cutout({
         baseSidecar: probe1.sidecarEntry,
         sciFull: sci1,
         varFull: var1,
         zodiFull: zodi1,
         jMin0Based: slice1.jMin0Based,
         rowCount: slice1.rowCount,
-        colCenter0Based: colCenter,
+        targetI0: starColExp1,
+        targetJ0: starRowExp1,
         channelIndex: chIdx,
         wavelengthUm: lamUm,
         passLabelOverride: 'PASS_1',
-        mjdOverride: probe1.sidecarEntry.mjdMidpoint,
+        mjdReal: probe1.sidecarEntry.mjdMidpoint,
         commonRaDeg,
         commonDecDeg,
       });
 
-      const cutout2 = buildHydratedCutoutFromLiveS3Slice({
+      const cutout2 = buildWcsAlignedLiveS3Cutout({
         baseSidecar: probe2.sidecarEntry,
         sciFull: sci2,
         varFull: var2,
         zodiFull: zodi2,
         jMin0Based: slice2.jMin0Based,
         rowCount: slice2.rowCount,
-        colCenter0Based: colCenter,
+        targetI0: proj2.x0BasedContinuous,
+        targetJ0: proj2.y0BasedContinuous,
         channelIndex: chIdx,
         wavelengthUm: lamUm,
         passLabelOverride: 'PASS_2',
-        mjdOverride: probe2.sidecarEntry.mjdMidpoint + 182.6,
+        mjdReal: probe2.sidecarEntry.mjdMidpoint,
         commonRaDeg,
         commonDecDeg,
       });
 
-      if (s === 0) {
+      if (det === 1 && s === 0) {
         allAstCutouts.push(cutout1, cutout2);
       }
 
@@ -823,18 +921,19 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
         const sci3 = decodeBigEndianFloat32(slice3.sciBuf);
         const var3 = decodeBigEndianFloat32(slice3.varBuf);
         const zodi3 = decodeBigEndianFloat32(slice3.zodiBuf);
-        const cutout3 = buildHydratedCutoutFromLiveS3Slice({
+        const cutout3 = buildWcsAlignedLiveS3Cutout({
           baseSidecar: probe3.sidecarEntry,
           sciFull: sci3,
           varFull: var3,
           zodiFull: zodi3,
           jMin0Based: slice3.jMin0Based,
           rowCount: slice3.rowCount,
-          colCenter0Based: colCenter,
+          targetI0: proj3.x0BasedContinuous,
+          targetJ0: proj3.y0BasedContinuous,
           channelIndex: chIdx,
           wavelengthUm: lamUm,
           passLabelOverride: 'PASS_3',
-          mjdOverride: probe3.sidecarEntry.mjdMidpoint + 365.25,
+          mjdReal: probe3.sidecarEntry.mjdMidpoint,
           commonRaDeg,
           commonDecDeg,
         });
@@ -857,7 +956,6 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
     }
   }
 
-  // Execute Branch 1: Differential ePSF Astrometry on Live S3 Cutouts
   const branch1 = runBranch1DifferentialAstrometry({
     cutouts: allAstCutouts,
     referenceRaDeg: commonRaDeg,
@@ -866,24 +964,19 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
     minProperMotionSigma: 5.0,
   });
 
-  // Execute Branch 2: Whitened ZOGY Photometry + Planck Fit on Live S3 Channels
   const branch2 = runBranch2PhotometryAndVeto({
     channelPairs,
     minBroadbandZogySigma: 5.0,
     isAstrometricMover: branch1.triggered,
   });
 
-  // Query Live NASA JPL Small-Body Identification API at the real S3 exposure coordinates & MJD
   const liveJplVeto = await queryJplLiveSmallBodyVeto({
     raDeg: commonRaDeg,
     decDeg: commonDecDeg,
     mjd: primaryProbe.sidecarEntry.mjdMidpoint,
   });
-  if (liveJplVeto) {
-    branch2.mpcPerExposureVetoMatch = liveJplVeto;
-  }
+  branch2.mpcPerExposureVetoMatch = liveJplVeto;
 
-  // Execute Branch 3: Solid-State Volatile Ice Equivalent Widths on Live S3 Spectrum
   const branch3 = runBranch3SpectralIceAnalysis({
     channelPairs,
     minIceEwSnrSigma: 4.5,
@@ -894,7 +987,7 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
   if (branch2.triggered) triggeredBranches.push('BRANCH_2_WHITENED_PHOTOMETRY');
   if (branch3.triggered) triggeredBranches.push('BRANCH_3_VOLATILE_ICE_SED');
   if (triggeredBranches.length === 0) {
-    triggeredBranches.push('LIVE_S3_QUIESCENT_FIELD_BASELINE');
+    triggeredBranches.push('LIVE_S3_CALIBRATION_FIELD_BASELINE');
   }
 
   let primaryClassification: AnomalyClassification =
@@ -941,12 +1034,11 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
         triggered_branches: triggeredBranches,
         passes_evaluated: {
           PASS_1_median_mjd: primaryProbe.sidecarEntry.mjdMidpoint,
-          PASS_2_median_mjd: Number(
-            (primaryProbe.sidecarEntry.mjdMidpoint + 0.0018).toFixed(5)
-          ),
-          PASS_3_median_mjd: Number(
-            (primaryProbe.sidecarEntry.mjdMidpoint + 0.0036).toFixed(5)
-          ),
+          PASS_2_median_mjd:
+            probedDetectors[0].probe2.sidecarEntry.mjdMidpoint,
+          PASS_3_median_mjd:
+            probedDetectors[0].probe3?.sidecarEntry.mjdMidpoint ??
+            primaryProbe.sidecarEntry.mjdMidpoint,
         },
         coordinates_epoch_j2026: {
           ra_deg: branch1.fittedRaDegJ2026,
@@ -969,7 +1061,7 @@ export async function runLiveS3FullThreeBranchPipeline(params?: {
           position_angle_deg_east_of_north:
             branch1.positionAngleDegEastOfNorth,
           single_band_zogy_dipole_peak_z: branch2.singleBandZogyDipolePeakZ,
-          mpc_per_exposure_veto_match: branch2.mpcPerExposureVetoMatch,
+          mpc_per_exposure_veto_match: liveJplVeto,
           mahalanobis_3pass_residual_chi2:
             branch1.mahalanobis3PassResidualChi2,
           mahalanobis_degrees_of_freedom: branch1.mahalanobisDegreesOfFreedom,

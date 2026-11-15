@@ -226,7 +226,6 @@ export function runBranch1DifferentialAstrometry(params: {
 
   const PIXEL_SCALE_ARCSEC = 6.15;
   const SIGMA_PHASE_PX = 0.008; // Residual ePSF pixel-phase error
-  const T0_MJD = 61040.0; // Reference epoch J2026.0
 
   const alpha0Rad = referenceRaDeg * DEG_TO_RAD;
   const delta0Rad = referenceDecDeg * DEG_TO_RAD;
@@ -282,7 +281,7 @@ export function runBranch1DifferentialAstrometry(params: {
   }
 
   const distinctPasses = new Set(measurements.map((m) => m.passLabel));
-  if (measurements.length < 4 || distinctPasses.size < 2) {
+  if (measurements.length < 3 || distinctPasses.size < 2) {
     return {
       triggered: false,
       sourceMedianSnr: 0,
@@ -305,6 +304,8 @@ export function runBranch1DifferentialAstrometry(params: {
     };
   }
 
+  // Inside runBranch1DifferentialAstrometry in spherex-engine/backend/src/engine/astrometryBranch.ts:
+
   const sortedSnr = [...measurements].map((m) => m.snr).sort((a, b) => a - b);
   const sourceMedianSnr = sortedSnr[Math.floor(sortedSnr.length / 2)];
   const sortedSigPx = [...measurements]
@@ -314,9 +315,27 @@ export function runBranch1DifferentialAstrometry(params: {
     sortedSigPx[Math.floor(sortedSigPx.length / 2)].toFixed(4)
   );
 
-  // Equation 5.1 Step 3: Solve 5-parameter Weighted Linear Least Squares
-  // State vector theta = [xi_0, eta_0, mu_alpha*, mu_delta, parallax]^T
-  const nParams = distinctPasses.size >= 3 ? 5 : 4;
+  // 1. Center reference epoch T0_MJD at the inverse-variance weighted mean MJD of the data
+  //    so sum(w_m * dtYr_m) == 0, making (xi_0, eta_0) strictly orthogonal to proper motion!
+  let wSum = 0;
+  let wMjdSum = 0;
+  let minMjd = Infinity;
+  let maxMjd = -Infinity;
+
+  for (const m of measurements) {
+    const w = 1.0 / (m.sigmaCentroidArcsec * m.sigmaCentroidArcsec);
+    wSum += w;
+    wMjdSum += w * m.mjd;
+    if (m.mjd < minMjd) minMjd = m.mjd;
+    if (m.mjd > maxMjd) maxMjd = m.mjd;
+  }
+
+  const T0_MJD = wSum > 0 ? wMjdSum / wSum : measurements[0].mjd;
+  const dtSpanDays = maxMjd - minMjd;
+
+  // 2. Solve 5-parameter Weighted Linear Least Squares:
+  //    theta = [xi_0, eta_0, mu_alpha*, mu_delta, parallax]^T
+  const nParams = 5;
   const AtWA = Array.from({ length: nParams }, () => Array(nParams).fill(0));
   const AtWY = Array(nParams).fill(0);
 
@@ -324,10 +343,8 @@ export function runBranch1DifferentialAstrometry(params: {
     const dtYr = (m.mjd - T0_MJD) / 365.25;
     const w = 1.0 / (m.sigmaCentroidArcsec * m.sigmaCentroidArcsec);
 
-    // Row for xi(t_m) = xi_0 + mu_alpha* * dtYr + parallax * P_alpha
-    const rowXi = nParams === 5 ? [1, 0, dtYr, 0, m.pAlpha] : [1, 0, dtYr, 0];
-    // Row for eta(t_m) = eta_0 + mu_delta * dtYr + parallax * P_delta
-    const rowEta = nParams === 5 ? [0, 1, 0, dtYr, m.pDelta] : [0, 1, 0, dtYr];
+    const rowXi = [1, 0, dtYr, 0, m.pAlpha];
+    const rowEta = [0, 1, 0, dtYr, m.pDelta];
 
     for (let r = 0; r < nParams; r++) {
       AtWY[r] += w * (rowXi[r] * m.xiObsArcsec + rowEta[r] * m.etaObsArcsec);
@@ -336,6 +353,19 @@ export function runBranch1DifferentialAstrometry(params: {
       }
     }
   }
+
+  // 3. Apply Bayesian Gaussian prior regularization on (mu_alpha*, mu_delta, parallax):
+  //    - For multi-pass survey baselines (dtSpanDays >= 30 days): weak physical prior
+  //      (sigma_mu = 30"/yr, sigma_parallax = 1.0")
+  //    - For short intra-pass baselines (dtSpanDays < 30 days, e.g. minutes apart on S3):
+  //      galactic field star prior (sigma_mu = 0.5"/yr, sigma_parallax = 0.05") prevents
+  //      collinear blowup when dtYr ~ 1e-5 yr.
+  const priorSigmaMu = dtSpanDays >= 30.0 ? 30.0 : 0.5;
+  const priorSigmaParallax = dtSpanDays >= 30.0 ? 1.0 : 0.05;
+
+  AtWA[2][2] += 1.0 / (priorSigmaMu * priorSigmaMu);
+  AtWA[3][3] += 1.0 / (priorSigmaMu * priorSigmaMu);
+  AtWA[4][4] += 1.0 / (priorSigmaParallax * priorSigmaParallax);
 
   const covAst = invertSquareMatrix(AtWA);
   const theta = Array(nParams).fill(0);
@@ -349,11 +379,11 @@ export function runBranch1DifferentialAstrometry(params: {
   const eta0 = theta[1];
   const muAlpha = theta[2];
   const muDelta = theta[3];
-  const parallax = nParams === 5 ? Math.max(0, theta[4]) : 0;
+  const parallax = Math.max(0, theta[4]);
 
   const varMuAlpha = Math.max(1e-8, covAst[2][2]);
   const varMuDelta = Math.max(1e-8, covAst[3][3]);
-  const varParallax = nParams === 5 ? Math.max(1e-8, covAst[4][4]) : 0.01;
+  const varParallax = Math.max(1e-8, covAst[4][4]);
 
   const muTotal = Math.hypot(muAlpha, muDelta);
   const sigmaMuTotal =
@@ -364,8 +394,9 @@ export function runBranch1DifferentialAstrometry(params: {
         )
       : Math.sqrt(0.5 * (varMuAlpha + varMuDelta));
 
-  const pmSignificance = muTotal / sigmaMuTotal;
-  const posAngleDeg = ((Math.atan2(muAlpha, muDelta) * 180.0) / Math.PI + 360.0) % 360.0;
+  const pmSignificance = dtSpanDays >= 30.0 ? muTotal / sigmaMuTotal : 0.0;
+  const posAngleDeg =
+    ((Math.atan2(muAlpha, muDelta) * 180.0) / Math.PI + 360.0) % 360.0;
 
   // Equation 5.4: Compute 3-Pass Tangent-Plane Mahalanobis Residual Chi^2
   // Group measurements by pass to produce clean pass-level trajectory samples
