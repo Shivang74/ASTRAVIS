@@ -111,7 +111,7 @@ export function querySpatialSpectralSidecarIndex(params: {
   const targetChannelIndices =
     executionMode === 'ISO_WAVELENGTH_SCREENING'
       ? [18, 56, 88] // ~1.05 um, ~2.31 um, ~4.08 um
-      : nominalGrid.slice(0, 98).map((c) => c.channelIndex);
+      : nominalGrid.map((c) => c.channelIndex);
 
   const PIXEL_SCALE_DEG = 6.15 / 3600.0; // 0.0017083333 deg/px
   const HDU_HEADER_BYTES = 2880;

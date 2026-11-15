@@ -21,6 +21,7 @@ import {
   runBranch2PhotometryAndVeto,
 } from './engine/photometryZogyBranch';
 import { runBranch3SpectralIceAnalysis } from './engine/spectralIceBranch';
+import { runLiveS3FullThreeBranchPipeline } from './services/nasaLiveApis';
 
 const app = express();
 app.use(cors());
@@ -73,6 +74,21 @@ app.get('/api/v1/health', (_req: Request, res: Response) => {
     status: 'HEALTHY',
     passes_registered: SURVEY_PASS_REGISTRY,
   });
+});
+
+app.get('/api/v1/live-irsa-search', async (req: Request, res: Response) => {
+  const detectorOverride = Number(req.query.detector ?? 1);
+  try {
+    const result = await runLiveS3FullThreeBranchPipeline({
+      detectorOverride,
+    });
+    res.status(200).json(result);
+  } catch (err) {
+    res.status(502).json({
+      status: 'LIVE_S3_PIPELINE_ERROR',
+      message: (err as Error).message,
+    });
+  }
 });
 
 app.post('/api/v1/spectral-delta', async (req: Request, res: Response) => {

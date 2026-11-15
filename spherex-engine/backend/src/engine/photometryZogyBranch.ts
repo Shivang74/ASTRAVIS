@@ -512,7 +512,7 @@ export function runBranch2PhotometryAndVeto(params: {
     maxIntraPassDeviationZ >= 6.0;
 
   let mpcPerExposureVetoMatch: Branch2PhotometryResult['mpcPerExposureVetoMatch'] = null;
-  if (preset === 'MAIN_BELT_ASTEROID_VETO' || isLocalizedTracklet) {
+  if (preset === 'MAIN_BELT_ASTEROID_VETO') {
     const hitChannel =
       channelPairs.find((c) => Math.abs(c.whitenedScoreScorr) >= 5.0) ??
       channelPairs[0];
