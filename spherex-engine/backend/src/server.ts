@@ -1,5 +1,6 @@
 // spherex-engine/backend/src/server.ts
-
+import fs from 'fs';
+import path from 'path';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { z } from 'zod';
@@ -399,9 +400,17 @@ app.post('/api/v1/spectral-delta', async (req: Request, res: Response) => {
   }
 });
 
-const PORT = Number(process.env.PORT ?? 4000);
-app.listen(PORT, () => {
-  console.log(
-    `[SPEC-ASTRO-MEF-03] Anomaly Detection Engine listening on port ${PORT}`
-  );
+const PORT = Number(process.env.PORT) || 4000;
+// Place right before app.listen:
+const bundledDist = path.resolve(__dirname, '../frontend-dist');
+const monorepoDist = path.resolve(__dirname, '../../frontend/dist');
+const frontendDistPath = fs.existsSync(bundledDist) ? bundledDist : monorepoDist;
+
+app.use(express.static(frontendDistPath));
+
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(frontendDistPath, 'index.html'));
+});
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`ASTRAVIS Engine listening on port ${PORT}`);
 });

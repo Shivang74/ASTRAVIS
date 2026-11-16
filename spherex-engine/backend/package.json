@@ -4,11 +4,12 @@
   "private": true,
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc",
-    "start": "node dist/server.js"
+    "build": "cd ../frontend && npm install && npm run build",
+    "start": "npx tsx src/server.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "tsx": "^4.23.15",
     "express": "^4.21.1",
     "zod": "^3.23.8"
   },
